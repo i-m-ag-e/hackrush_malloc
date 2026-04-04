@@ -14,10 +14,10 @@
  * Compile:  gcc -std=c99 -Wall -o memsim starter_harness.c
  */
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 /* ── Device constants (do not change) ────────────────────────────────────────
@@ -82,10 +82,9 @@ static BlockHeader _read_header(int offset, bool *checksum_ok) {
 #define BLOCK_SIZE 64
 #define N_BLOCKS ((DEVICE_RAM) / (BLOCK_SIZE))
 
-int16_t used_blocks[N_BLOCKS];
-
-static int required_blocks(int n_bytes);
-static int find_free_blocks(int n_blocks);
+static int align_bytes(uint32_t n_bytes);
+static int find_free_block(uint32_t aligned_n_byte, int strategy);
+static void sweep_and_merge();
 
 /* ════════════════════════════════════════════════════════════════════════════
  * LEVEL 1 + 2 — Core allocator
@@ -99,7 +98,7 @@ void mem_init(void) {
      * TODO
      */
     memset(ram, 0, DEVICE_RAM);
-    memset(used_blocks, 0, sizeof(used_blocks));
+    _write_header(0, DEVICE_RAM - HEADER_SIZE, STATUS_FREE, 0);
 }
 
 /*
@@ -108,28 +107,33 @@ void mem_init(void) {
  * Returns offset to first usable byte (header_offset + HEADER_SIZE), or -1.
  */
 int mem_alloc(int n_bytes, int task_id, int strategy) {
-    (void)task_id;
     (void)strategy;
 
     if (n_bytes < MIN_ALLOC || n_bytes > MAX_ALLOC)
         return -1;
 
-    int blocks_needed = required_blocks(n_bytes);
-    int free_blocks_offset = find_free_blocks(blocks_needed);
+    int aligned_n_bytes = align_bytes(n_bytes);
+    int free_block = find_free_block(aligned_n_bytes, strategy);
 
-    if (free_blocks_offset == -1)
+    if (free_block == -1)
         return -1;
 
-    // set the first unused block to tell the number of blocks used in a single
-    // allocation
-    used_blocks[free_blocks_offset] = blocks_needed;
-    for (int i = 1; i < blocks_needed; ++i) {
-        // set all (n - 1) blocks after that to -1
-        // we don't necessarily need to do this. It just makes things simpler
-        used_blocks[free_blocks_offset + i] = -1;
+    bool checksum_ok;
+    BlockHeader header = _read_header(free_block, &checksum_ok);
+
+    int remaining_space = header.size - aligned_n_bytes;
+
+    if (remaining_space >= HEADER_SIZE + MIN_ALLOC) {
+        _write_header(free_block, aligned_n_bytes, STATUS_USED, task_id);
+
+        int next_free_location = free_block + HEADER_SIZE + aligned_n_bytes;
+        _write_header(next_free_location, remaining_space - HEADER_SIZE,
+                      STATUS_FREE, 0);
+    } else {
+        _write_header(free_block, header.size, STATUS_USED, task_id);
     }
 
-    return free_blocks_offset * 64;
+    return free_block + HEADER_SIZE;
 }
 
 /*
@@ -139,26 +143,18 @@ int mem_alloc(int n_bytes, int task_id, int strategy) {
  */
 bool mem_free(int ptr) {
     /* TODO */
-    (void)ptr;
 
-    if (ptr < 0 || ptr > DEVICE_RAM)
+    if (ptr < HEADER_SIZE || ptr > DEVICE_RAM - HEADER_SIZE)
         return false;
 
-    // since we only allocate blocks of 64, we can only free blocks of 64
-    if (ptr % 64 != 0)
+    bool checksum_ok;
+    BlockHeader header = _read_header(ptr - HEADER_SIZE, &checksum_ok);
+
+    if (!checksum_ok || header.status == STATUS_FREE)
         return false;
 
-    int block_index = ptr / 64;
-
-    int blocks_to_free = used_blocks[block_index];
-    // cannot free from the middle of an allocated block (-1), or an unallocated
-    // block (0)
-    if (blocks_to_free <= 0)
-        return false;
-
-    for (int i = 0; i < blocks_to_free; ++i) {
-        used_blocks[block_index + i] = 0;
-    }
+    _write_header(ptr - HEADER_SIZE, header.size, STATUS_FREE, header.task_id);
+    sweep_and_merge();
 
     return true;
 }
@@ -172,18 +168,29 @@ void mem_dump(void) {
      * TODO
      */
 
-    int free_blocks = 0;
-    for (int i = 0; i < N_BLOCKS; ++i) {
-        if (used_blocks[i] == 0)
-            free_blocks++;
-    }
+    int offset = 0;
+    int free_blocks = 0, used_blocks = 0;
+    int free_bytes = 0;
 
-    for (int i = 0; i < N_BLOCKS; ++i) {
-        printf("[offset=%04d  size=64  task=0  csum=OK  ]\n", i * 64);
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        printf(
+            "[  offset=%04d  size=%-5d  status=%-s  task=%-3d  csum=%-3s  ]\n",
+            offset, header.size, header.status == STATUS_FREE ? "FREE" : "USED",
+            header.task_id, checksum_ok ? "OK" : "BAD");
+        offset += header.size + HEADER_SIZE;
+
+        if (header.status == STATUS_FREE) {
+            free_blocks++;
+            free_bytes += header.size;
+        } else
+            used_blocks++;
     }
 
     printf("HEAP SUMMARY: %d blocks | %d used | %d free | %d free bytes\n",
-           N_BLOCKS, N_BLOCKS - free_blocks, free_blocks, free_blocks * 64);
+           used_blocks + free_blocks, used_blocks, free_blocks, free_bytes);
 }
 
 typedef struct {
@@ -198,14 +205,24 @@ MemStats mem_stats(void) {
     /* TODO */
     MemStats s = {0, 0, 0, 0.0f};
 
-    int free_blocks = 0;
-    for (int i = 0; i < N_BLOCKS; ++i) {
-        if (used_blocks[i] == 0)
-            free_blocks++;
+    int offset = 0;
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+        offset += header.size + HEADER_SIZE;
+
+        if (header.status == STATUS_FREE) {
+            s.total_free_bytes += header.size;
+            if (s.largest_free_block < (int)header.size)
+                s.largest_free_block = header.size;
+            s.num_free_fragments++;
+        }
     }
 
-    s.total_free_bytes = free_blocks * 64;
-    s.largest_free_block = 64;
+    s.fragmentation_ratio =
+        s.total_free_bytes == 0
+            ? 0
+            : 1 - s.largest_free_block / (double)s.total_free_bytes;
     return s;
 }
 
@@ -295,31 +312,69 @@ int mem_alloc_or_compact(int n_bytes, int task_id) {
 //     int p2 = mem_alloc(200, 2, 0);
 //     int p3 = mem_alloc(50, 1, 0);
 //     printf("Allocated: p1=%d  p2=%d  p3=%d\n", p1, p2, p3);
-//     mem_free(p2);
+//     mem_dump();
+//     if (!mem_free(p2))
+//         printf("free failed\n");
+//     if (!mem_free(p3))
+//         printf("free failed\n");
 //     mem_dump();
 //     MemStats s = mem_stats();
 //     printf("free=%d  largest=%d  frags=%d  ratio=%.3f\n", s.total_free_bytes,
 //            s.largest_free_block, s.num_free_fragments,
 //            s.fragmentation_ratio);
-//     return 0;
 // }
 
-static int required_blocks(int n_bytes) {
-    return (n_bytes / BLOCK_SIZE) + (bool)(n_bytes % BLOCK_SIZE);
+static int align_bytes(uint32_t n_bytes) {
+    // align to multiples of 4
+    return (n_bytes + 3) & ~3;
 }
 
-static int find_free_blocks(int n_blocks) {
-    int current_free_blocks = 0;
+static int find_free_block(uint32_t aligned_n_bytes, int strategy) {
+    assert(aligned_n_bytes % 4 == 0);
 
-    for (int i = 0; i < N_BLOCKS; ++i) {
-        if (used_blocks[i] == 0)
-            current_free_blocks++;
-        else
-            current_free_blocks = 0;
+    int offset = 0;
+    int best_fit = -1, best_fit_diff = 0;
+    while (offset < DEVICE_RAM) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
 
-        if (current_free_blocks == n_blocks)
-            return i - current_free_blocks + 1;
+        if (header.status == STATUS_FREE && header.size >= aligned_n_bytes) {
+            if (strategy == 0 || header.size == aligned_n_bytes)
+                return offset;
+            else if (strategy == 1 &&
+                     (best_fit == -1 || header.size - aligned_n_bytes <
+                                            (uint32_t)best_fit_diff)) {
+                best_fit_diff = header.size - aligned_n_bytes;
+                best_fit = offset;
+            }
+        }
+        offset += header.size + HEADER_SIZE;
     }
 
-    return -1;
+    return best_fit;
+}
+
+static void sweep_and_merge() {
+    int offset = 0;
+
+    int prev_free = -1;
+    BlockHeader prev_free_header;
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        if (header.status == STATUS_FREE) {
+            if (prev_free != -1) {
+                prev_free_header.size += header.size + HEADER_SIZE;
+                _write_header(prev_free, prev_free_header.size, STATUS_FREE, 0);
+            } else {
+                prev_free = offset;
+                prev_free_header = header;
+            }
+        } else {
+            prev_free = -1;
+        }
+
+        offset += header.size + HEADER_SIZE;
+    }
 }
