@@ -82,9 +82,28 @@ static BlockHeader _read_header(int offset, bool *checksum_ok) {
 #define BLOCK_SIZE 64
 #define N_BLOCKS ((DEVICE_RAM) / (BLOCK_SIZE))
 
+#define MAX_TASKS 256
+
+typedef struct {
+    int task_id;
+    int quota_bytes;
+    int bytes_allocated; /* peak allocated */
+    bool quota_exceeded;
+    /* leaks: scan after fn() returns for blocks still tagged with task_id */
+} TaskReport;
+
+typedef struct {
+    TaskReport report;
+    int current_alloc;
+    bool active;
+} TaskStatus;
+
+static TaskStatus tasks[MAX_TASKS];
+
 static int align_bytes(uint32_t n_bytes);
 static int find_free_block(uint32_t aligned_n_byte, int strategy);
 static void sweep_and_merge();
+static bool task_is_active(int task_id);
 
 /* ════════════════════════════════════════════════════════════════════════════
  * LEVEL 1 + 2 — Core allocator
@@ -113,8 +132,18 @@ int mem_alloc(int n_bytes, int task_id, int strategy) {
         return -1;
 
     int aligned_n_bytes = align_bytes(n_bytes);
-    int free_block = find_free_block(aligned_n_bytes, strategy);
 
+    // check if this allocation would put us over quota before we do any work
+    // we do this check later as well, but this is a quick early check to avoid
+    // doing the work of finding a free block
+    if (task_is_active(task_id) &&
+        tasks[task_id].current_alloc + aligned_n_bytes + HEADER_SIZE >
+            tasks[task_id].report.quota_bytes) {
+        tasks[task_id].report.quota_exceeded = true;
+        return -1;
+    }
+
+    int free_block = find_free_block(aligned_n_bytes, strategy);
     if (free_block == -1)
         return -1;
 
@@ -123,14 +152,41 @@ int mem_alloc(int n_bytes, int task_id, int strategy) {
 
     int remaining_space = header.size - aligned_n_bytes;
 
-    if (remaining_space >= HEADER_SIZE + MIN_ALLOC) {
+    // after the split, do we have enough space left to fit another block with
+    // its header and minimum alloc if not, we won't split and will just give
+    // the whole block to the user
+    bool will_split = remaining_space >= HEADER_SIZE + MIN_ALLOC;
+    int given_size = will_split ? aligned_n_bytes : header.size;
+
+    // this time, check against the actual size we would be allocating
+    if (task_is_active(task_id) &&
+        tasks[task_id].current_alloc + given_size + HEADER_SIZE >=
+            tasks[task_id].report.quota_bytes) {
+        tasks[task_id].report.quota_exceeded = true;
+        return -1;
+    }
+
+    if (will_split) {
         _write_header(free_block, aligned_n_bytes, STATUS_USED, task_id);
 
+        // split the current block and write a new header for the remaining free
+        // space
         int next_free_location = free_block + HEADER_SIZE + aligned_n_bytes;
         _write_header(next_free_location, remaining_space - HEADER_SIZE,
                       STATUS_FREE, 0);
     } else {
+        // give the whole block to the user without splitting
         _write_header(free_block, header.size, STATUS_USED, task_id);
+    }
+
+    if (task_is_active(task_id)) {
+        tasks[task_id].current_alloc += given_size + HEADER_SIZE;
+
+        if (tasks[task_id].current_alloc >
+            tasks[task_id].report.bytes_allocated) {
+            tasks[task_id].report.bytes_allocated =
+                tasks[task_id].current_alloc;
+        }
     }
 
     return free_block + HEADER_SIZE;
@@ -150,11 +206,18 @@ bool mem_free(int ptr) {
     bool checksum_ok;
     BlockHeader header = _read_header(ptr - HEADER_SIZE, &checksum_ok);
 
+    // if checksum is bad, the user is probably trying to free a pointer that is
+    // in the middle of a block, or just a random number otherwise, if the block
+    // is already free, then it is a double free
     if (!checksum_ok || header.status == STATUS_FREE)
         return false;
 
     _write_header(ptr - HEADER_SIZE, header.size, STATUS_FREE, header.task_id);
     sweep_and_merge();
+
+    if (header.task_id > 0 && task_is_active(header.task_id)) {
+        tasks[header.task_id].current_alloc -= header.size + HEADER_SIZE;
+    }
 
     return true;
 }
@@ -231,23 +294,27 @@ MemStats mem_stats(void) {
  * ════════════════════════════════════════════════════════════════════════════
  */
 
-typedef struct {
-    int task_id;
-    int quota_bytes;
-    int bytes_allocated; /* peak allocated */
-    bool quota_exceeded;
-    /* leaks: scan after fn() returns for blocks still tagged with task_id */
-} TaskReport;
-
 typedef void (*TaskFn)(void);
 
 TaskReport task_spawn(int task_id, int quota_bytes, TaskFn fn) {
-    /* TODO */
-    (void)task_id;
-    (void)quota_bytes;
-    (void)fn;
-    TaskReport r = {task_id, quota_bytes, 0, false};
-    return r;
+    tasks[task_id] = (TaskStatus){.report = {.task_id = task_id,
+                                             .bytes_allocated = 0,
+                                             .quota_bytes = quota_bytes,
+                                             .quota_exceeded = false},
+                                  .current_alloc = 0,
+                                  .active = true};
+
+    fn();
+
+    // if task still has allocated blocks, report them as leaks
+    if (tasks[task_id].current_alloc != 0) {
+        printf("Task %d leaked %d bytes\n", task_id,
+               tasks[task_id].current_alloc);
+    }
+
+    tasks[task_id].active = false;
+
+    return tasks[task_id].report;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -306,23 +373,92 @@ int mem_alloc_or_compact(int n_bytes, int task_id) {
  * ════════════════════════════════════════════════════════════════════════════
  */
 
-// int main(void) {
-//     mem_init();
-//     int p1 = mem_alloc(100, 1, 0);
-//     int p2 = mem_alloc(200, 2, 0);
-//     int p3 = mem_alloc(50, 1, 0);
-//     printf("Allocated: p1=%d  p2=%d  p3=%d\n", p1, p2, p3);
-//     mem_dump();
-//     if (!mem_free(p2))
-//         printf("free failed\n");
-//     if (!mem_free(p3))
-//         printf("free failed\n");
-//     mem_dump();
-//     MemStats s = mem_stats();
-//     printf("free=%d  largest=%d  frags=%d  ratio=%.3f\n", s.total_free_bytes,
-//            s.largest_free_block, s.num_free_fragments,
-//            s.fragmentation_ratio);
-// }
+void good_task() {
+    int p = mem_alloc(100, 1, 0);  // Task 1 asks for 100
+    mem_free(p);                   // Cleans up after itself
+}
+
+void leaky_task() {
+    mem_alloc(200, 2, 0);  // Task 2 allocates, but never calls free()
+}
+
+void greedy_task() {
+    // Task 3 tries to allocate 3000 bytes three times (9000 total)
+    mem_alloc(3000, 3, 0);  // 1st call: Success (Usage: ~3000)
+    mem_alloc(3000, 3, 0);  // 2nd call: Success (Usage: ~6000)
+    mem_alloc(3000, 3, 0);  // 3rd call: Watchdog triggers! (9000 > 8192)
+}
+
+void complex_worker() {
+    // THIS TEST WAS GENERATED USING GenAI
+
+    printf("\n--- Starting Complex Worker (Task 4) ---\n");
+    int live_cache_ptrs[5];
+
+    // Loop 5 times, simulating processing 5 chunks of data
+    for (int i = 0; i < 5; i++) {
+        // 1. Allocate a large temporary buffer
+        int temp_ptr = mem_alloc(1000, 4, 0);
+        if (temp_ptr != -1) {
+            // ... (Imagine we process data in this buffer) ...
+
+            // Immediately free the temp buffer.
+            // This keeps our "current_allocated" math bouncing up and down!
+            mem_free(temp_ptr);
+        }
+
+        // 2. Allocate a smaller "cache" block to save the results
+        int cache_ptr = mem_alloc(200, 4, 0);
+        if (cache_ptr != -1) {
+            // We store the pointer but NEVER call mem_free on it.
+            // This creates a slow, creeping memory leak.
+            live_cache_ptrs[i] = cache_ptr;
+        }
+    }
+
+    // At this point, the loop is done.
+    // We allocated and freed 1000 bytes 5 times successfully.
+    // But we left behind FIVE 200-byte cache blocks.
+
+    // 3. The greedy finish.
+    // Let's ask for 3500 bytes. Because we leaked so much cache memory,
+    // this request will push us over our 4096-byte quota!
+    printf("  [Task 4] Attempting final large allocation of 3500 bytes...\n");
+    int greedy_ptr = mem_alloc(3500, 4, 0);
+
+    if (greedy_ptr == -1) {
+        printf("  [Task 4] Allocation failed! Watchdog caught us.\n");
+    }
+}
+
+int main(void) {
+    mem_init();
+
+    TaskReport r1 = task_spawn(1, 8192, good_task);
+    TaskReport r2 = task_spawn(2, 8192, leaky_task);
+    TaskReport r3 = task_spawn(3, 8192, greedy_task);
+
+    printf(
+        "Report Task 1: Quota %d bytes, Peak Allocated %d bytes, Quota "
+        "Exceeded: %s\n",
+        r1.quota_bytes, r1.bytes_allocated, r1.quota_exceeded ? "YES" : "NO");
+    printf(
+        "Report Task 2: Quota %d bytes, Peak Allocated %d bytes, Quota "
+        "Exceeded: %s\n",
+        r2.quota_bytes, r2.bytes_allocated, r2.quota_exceeded ? "YES" : "NO");
+    printf(
+        "Report Task 3: Quota %d bytes, Peak Allocated %d bytes, Quota "
+        "Exceeded: %s\n",
+        r3.quota_bytes, r3.bytes_allocated, r3.quota_exceeded ? "YES" : "NO");
+    // Run the complex simulation with a 4KB Quota
+    TaskReport r4 = task_spawn(4, 4096, complex_worker);
+
+    printf(
+        "Report Task 4: Quota %d bytes, Peak Allocated %d bytes, Quota "
+        "Exceeded: %s\n",
+        r4.quota_bytes, r4.bytes_allocated, r4.quota_exceeded ? "YES" : "NO");
+    return 0;
+}
 
 static int align_bytes(uint32_t n_bytes) {
     // align to multiples of 4
@@ -338,6 +474,7 @@ static int find_free_block(uint32_t aligned_n_bytes, int strategy) {
         bool checksum_ok;
         BlockHeader header = _read_header(offset, &checksum_ok);
 
+        // if block is free and large enough
         if (header.status == STATUS_FREE && header.size >= aligned_n_bytes) {
             if (strategy == 0 || header.size == aligned_n_bytes)
                 return offset;
@@ -348,9 +485,14 @@ static int find_free_block(uint32_t aligned_n_bytes, int strategy) {
                 best_fit = offset;
             }
         }
+        // go to next block
         offset += header.size + HEADER_SIZE;
     }
 
+    // if strategy was 0 and something was found, we would have returned already
+    // else if didn't find anything, we return -1, which is correct for both
+    // strategies the only case left is strategy 1 and we found something, so we
+    // return best_fit
     return best_fit;
 }
 
@@ -365,6 +507,7 @@ static void sweep_and_merge() {
 
         if (header.status == STATUS_FREE) {
             if (prev_free != -1) {
+                // reflect the merge in the header of the previous free block
                 prev_free_header.size += header.size + HEADER_SIZE;
                 _write_header(prev_free, prev_free_header.size, STATUS_FREE, 0);
             } else {
@@ -377,4 +520,8 @@ static void sweep_and_merge() {
 
         offset += header.size + HEADER_SIZE;
     }
+}
+
+static bool task_is_active(int task_id) {
+    return task_id > 0 && task_id < MAX_TASKS && tasks[task_id].active;
 }
