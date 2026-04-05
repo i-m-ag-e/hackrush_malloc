@@ -1,5 +1,18 @@
 ## Level 1
 
+### Usage
+`make` and a C compiler supporting C17 is needed (this can be changed in the Makefile) for the following instructions
+
+```shell
+git clone https://github.com/i-m-ag-e/hackrush_malloc.git
+git checkout level_1
+make # creates an executable test_level_1
+```
+
+`test_level_1.c` is the `level1_stress_test.py` file converted to C (using GenAI). For this, the `main()` function in the initial starter file has been commented out. 
+
+### Description
+
 For level 1, I have declared a global `used_blocks` array of `int16_t`. I have used `int16_t` instead of `bool` as suggested, because for requested bytes >64, we will need to free more than 1 block at a time (at the time of freeing). So, `used_blocks[i]` will store the number of blocks that are currently being used starting from block `i`. For example,
 - `used_blocks[0] = 3` means that blocks 0, 1 and 2 are currently being used. (further, `used_blocks[1]` and `used_blocks[2]` are set to -1 to denote that they are being used as part of a larger allocation)
 - `used_blocks[0] = 0` means that block 0 is currently free
