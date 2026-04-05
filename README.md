@@ -22,6 +22,8 @@ To run the tests
 ./test_level_4
 ```
 
+PS: I have comments in the code to explain where I felt explanation was necessaey. The comments were not added by AI. I have explicitly mentioned what has been written by AI in the functions or in the README (specifically, the benchmarks and the conversion of the stress tests to C has been done by AI). I have used AI to learn and to see how to do specific things. 
+
 ## Level 1
 
 `test_level_1.c` is the `level1_stress_test.py` file converted to C (using GenAI). For this, the `main()` function in the initial starter file has been commented out. 
