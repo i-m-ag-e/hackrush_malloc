@@ -24,7 +24,7 @@
  */
 #define DEVICE_RAM (64 * 1024)
 #define MIN_ALLOC 4
-#define MAX_ALLOC 4096
+#define MAX_ALLOC 8192
 #define ALIGNMENT 4
 #define HEADER_SIZE 8
 
@@ -100,10 +100,11 @@ typedef struct {
 
 static TaskStatus tasks[MAX_TASKS];
 
-static int align_bytes(uint32_t n_bytes);
+static uint32_t align_bytes(uint32_t n_bytes);
 static int find_free_block(uint32_t aligned_n_byte, int strategy);
 static void sweep_and_merge();
 static bool task_is_active(int task_id);
+static void free_task_blocks(int task_id);
 
 /* ════════════════════════════════════════════════════════════════════════════
  * LEVEL 1 + 2 — Core allocator
@@ -131,13 +132,13 @@ int mem_alloc(int n_bytes, int task_id, int strategy) {
     if (n_bytes < MIN_ALLOC || n_bytes > MAX_ALLOC)
         return -1;
 
-    int aligned_n_bytes = align_bytes(n_bytes);
+    uint32_t aligned_n_bytes = align_bytes(n_bytes);
 
     // check if this allocation would put us over quota before we do any work
     // we do this check later as well, but this is a quick early check to avoid
     // doing the work of finding a free block
     if (task_is_active(task_id) &&
-        tasks[task_id].current_alloc + aligned_n_bytes + HEADER_SIZE >
+        (int)(tasks[task_id].current_alloc + aligned_n_bytes + HEADER_SIZE) >
             tasks[task_id].report.quota_bytes) {
         tasks[task_id].report.quota_exceeded = true;
         return -1;
@@ -156,11 +157,11 @@ int mem_alloc(int n_bytes, int task_id, int strategy) {
     // its header and minimum alloc if not, we won't split and will just give
     // the whole block to the user
     bool will_split = remaining_space >= HEADER_SIZE + MIN_ALLOC;
-    int given_size = will_split ? aligned_n_bytes : header.size;
+    uint32_t given_size = will_split ? aligned_n_bytes : header.size;
 
     // this time, check against the actual size we would be allocating
     if (task_is_active(task_id) &&
-        tasks[task_id].current_alloc + given_size + HEADER_SIZE >=
+        (int)(tasks[task_id].current_alloc + given_size + HEADER_SIZE) >=
             tasks[task_id].report.quota_bytes) {
         tasks[task_id].report.quota_exceeded = true;
         return -1;
@@ -336,14 +337,37 @@ void handles_init(void) {
 /* Returns handle (>= 0) or -1 on failure. */
 int mem_alloc_handle(int n_bytes, int task_id) {
     /* TODO */
-    (void)n_bytes;
-    (void)task_id;
-    return -1;
+    int handle = -1;
+    for (int i = 0; i < MAX_HANDLES; ++i) {
+        // set to unused handle
+        if (handle_table[i] == -1) {
+            handle = i;
+            break;
+        }
+    }
+
+    if (handle == -1)
+        return -1;
+
+    int ptr = mem_alloc(n_bytes, task_id, 1);
+    if (ptr == -1)
+        return -1;
+
+    handle_table[handle] = ptr;
+    return handle;
 }
 
+int deref_handle(int handle);
+
 bool mem_free_handle(int handle) {
-    /* TODO */
-    (void)handle;
+    int ptr = deref_handle(handle);
+    if (ptr == -1)
+        return -1;
+
+    if (mem_free(ptr)) {
+        handle_table[handle] = -1;
+        return true;
+    }
     return false;
 }
 
@@ -356,111 +380,195 @@ int deref_handle(int handle) {
 
 /* Compact heap, patch handle_table. Returns bytes recovered. */
 int mem_compact(void) {
-    /* TODO */
-    return 0;
+    int read_head = 0, write_head = 0;
+
+    while (read_head < DEVICE_RAM) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(read_head, &checksum_ok);
+
+        if (header.status == STATUS_USED) {
+            int block_size = header.size + HEADER_SIZE;
+
+            if (write_head != read_head) {
+                memmove(&ram[write_head], &ram[read_head], block_size);
+
+                int old_ptr = read_head + HEADER_SIZE;
+                int new_ptr = write_head + HEADER_SIZE;
+
+                // update handle table for this block
+                for (int i = 0; i < MAX_HANDLES; ++i) {
+                    if (handle_table[i] == old_ptr) {
+                        handle_table[i] = new_ptr;
+                        break;
+                    }
+                }
+            }
+
+            write_head += block_size;
+        }
+
+        read_head += header.size + HEADER_SIZE;
+    }
+
+    int free_bytes = 0;
+    if (write_head < DEVICE_RAM) {
+        int remaining_bytes = DEVICE_RAM - write_head;
+        if (remaining_bytes >= HEADER_SIZE + MIN_ALLOC) {
+            _write_header(write_head, remaining_bytes - HEADER_SIZE,
+                          STATUS_FREE, 0);
+            free_bytes = remaining_bytes;
+        }
+    }
+
+    sweep_and_merge();
+
+    return free_bytes;
 }
 
 /* Alloc with compaction + OOM eviction fallback. Returns handle or -1. */
 int mem_alloc_or_compact(int n_bytes, int task_id) {
-    /* TODO */
-    (void)n_bytes;
-    (void)task_id;
+    int handle = mem_alloc_handle(n_bytes, task_id);
+    if (handle != -1)
+        return handle;
+
+    printf(
+        "mem_alloc_or_compact: request of %d bytes from task %d failed, "
+        "attempting compaction...\n",
+        n_bytes, task_id);
+
+    mem_compact();
+    handle = mem_alloc_handle(n_bytes, task_id);
+
+    if (handle != -1)
+        return handle;
+
+    printf(
+        "mem_alloc_or_compact: compaction failed; searching for task to "
+        "evict\n");
+
+    int largest_idle_task = -1;
+    int largest_idle_alloc = 0;
+    for (int i = 1; i < MAX_TASKS; ++i) {
+        if (!task_is_active(i) && tasks[i].current_alloc > largest_idle_alloc) {
+            largest_idle_task = i;
+            largest_idle_alloc = tasks[i].current_alloc;
+        }
+    }
+
+    if (largest_idle_task != -1) {
+        printf("mem_alloc_or_compact: evicting task %d, reclaiming %d bytes\n",
+               largest_idle_task, largest_idle_alloc);
+
+        free_task_blocks(largest_idle_task);
+        tasks[largest_idle_task].active = false;
+
+        handle = mem_alloc_handle(n_bytes, task_id);
+        if (handle != -1)
+            return handle;
+    }
+
+    printf(
+        "mem_alloc_or_compact: Fatal error: both compaction and eviction "
+        "failed\n");
     return -1;
 }
 
-/* ════════════════════════════════════════════════════════════════════════════
- * Entry point — quick sanity check
- * ════════════════════════════════════════════════════════════════════════════
- */
+// --------------------------------
+// Uncomment these functions and the main() below to run the tests for level 3
+// --------------------------------
 
-void good_task() {
-    int p = mem_alloc(100, 1, 0);  // Task 1 asks for 100
-    mem_free(p);                   // Cleans up after itself
-}
+// void good_task() {
+//     int p = mem_alloc(100, 1, 0);  // Task 1 asks for 100
+//     mem_free(p);                   // Cleans up after itself
+// }
 
-void leaky_task() {
-    mem_alloc(200, 2, 0);  // Task 2 allocates, but never calls free()
-}
+// void leaky_task() {
+//     mem_alloc(200, 2, 0);  // Task 2 allocates, but never calls free()
+// }
 
-void greedy_task() {
-    // Task 3 tries to allocate 3000 bytes three times (9000 total)
-    mem_alloc(3000, 3, 0);  // 1st call: Success (Usage: ~3000)
-    mem_alloc(3000, 3, 0);  // 2nd call: Success (Usage: ~6000)
-    mem_alloc(3000, 3, 0);  // 3rd call: Watchdog triggers! (9000 > 8192)
-}
+// void greedy_task() {
+//     // Task 3 tries to allocate 3000 bytes three times (9000 total)
+//     mem_alloc(3000, 3, 0);  // 1st call: Success (Usage: ~3000)
+//     mem_alloc(3000, 3, 0);  // 2nd call: Success (Usage: ~6000)
+//     mem_alloc(3000, 3, 0);  // 3rd call: Watchdog triggers! (9000 > 8192)
+// }
 
-void complex_worker() {
-    // THIS TEST WAS GENERATED USING GenAI
+// void complex_worker() {
+//     // THIS TEST WAS GENERATED USING GenAI
 
-    printf("\n--- Starting Complex Worker (Task 4) ---\n");
-    int live_cache_ptrs[5];
+//     printf("\n--- Starting Complex Worker (Task 4) ---\n");
+//     int live_cache_ptrs[5];
 
-    // Loop 5 times, simulating processing 5 chunks of data
-    for (int i = 0; i < 5; i++) {
-        // 1. Allocate a large temporary buffer
-        int temp_ptr = mem_alloc(1000, 4, 0);
-        if (temp_ptr != -1) {
-            // ... (Imagine we process data in this buffer) ...
+//     // Loop 5 times, simulating processing 5 chunks of data
+//     for (int i = 0; i < 5; i++) {
+//         // 1. Allocate a large temporary buffer
+//         int temp_ptr = mem_alloc(1000, 4, 0);
+//         if (temp_ptr != -1) {
+//             // ... (Imagine we process data in this buffer) ...
 
-            // Immediately free the temp buffer.
-            // This keeps our "current_allocated" math bouncing up and down!
-            mem_free(temp_ptr);
-        }
+//             // Immediately free the temp buffer.
+//             // This keeps our "current_allocated" math bouncing up and down!
+//             mem_free(temp_ptr);
+//         }
 
-        // 2. Allocate a smaller "cache" block to save the results
-        int cache_ptr = mem_alloc(200, 4, 0);
-        if (cache_ptr != -1) {
-            // We store the pointer but NEVER call mem_free on it.
-            // This creates a slow, creeping memory leak.
-            live_cache_ptrs[i] = cache_ptr;
-        }
-    }
+//         // 2. Allocate a smaller "cache" block to save the results
+//         int cache_ptr = mem_alloc(200, 4, 0);
+//         if (cache_ptr != -1) {
+//             // We store the pointer but NEVER call mem_free on it.
+//             // This creates a slow, creeping memory leak.
+//             live_cache_ptrs[i] = cache_ptr;
+//         }
+//     }
 
-    // At this point, the loop is done.
-    // We allocated and freed 1000 bytes 5 times successfully.
-    // But we left behind FIVE 200-byte cache blocks.
+//     // At this point, the loop is done.
+//     // We allocated and freed 1000 bytes 5 times successfully.
+//     // But we left behind FIVE 200-byte cache blocks.
 
-    // 3. The greedy finish.
-    // Let's ask for 3500 bytes. Because we leaked so much cache memory,
-    // this request will push us over our 4096-byte quota!
-    printf("  [Task 4] Attempting final large allocation of 3500 bytes...\n");
-    int greedy_ptr = mem_alloc(3500, 4, 0);
+//     // 3. The greedy finish.
+//     // Let's ask for 3500 bytes. Because we leaked so much cache memory,
+//     // this request will push us over our 4096-byte quota!
+//     printf("  [Task 4] Attempting final large allocation of 3500
+//     bytes...\n"); int greedy_ptr = mem_alloc(3500, 4, 0);
 
-    if (greedy_ptr == -1) {
-        printf("  [Task 4] Allocation failed! Watchdog caught us.\n");
-    }
-}
+//     if (greedy_ptr == -1) {
+//         printf("  [Task 4] Allocation failed! Watchdog caught us.\n");
+//     }
+// }
 
-int main(void) {
-    mem_init();
+// int main(void) {
+//     mem_init();
 
-    TaskReport r1 = task_spawn(1, 8192, good_task);
-    TaskReport r2 = task_spawn(2, 8192, leaky_task);
-    TaskReport r3 = task_spawn(3, 8192, greedy_task);
+//     TaskReport r1 = task_spawn(1, 8192, good_task);
+//     TaskReport r2 = task_spawn(2, 8192, leaky_task);
+//     TaskReport r3 = task_spawn(3, 8192, greedy_task);
 
-    printf(
-        "Report Task 1: Quota %d bytes, Peak Allocated %d bytes, Quota "
-        "Exceeded: %s\n",
-        r1.quota_bytes, r1.bytes_allocated, r1.quota_exceeded ? "YES" : "NO");
-    printf(
-        "Report Task 2: Quota %d bytes, Peak Allocated %d bytes, Quota "
-        "Exceeded: %s\n",
-        r2.quota_bytes, r2.bytes_allocated, r2.quota_exceeded ? "YES" : "NO");
-    printf(
-        "Report Task 3: Quota %d bytes, Peak Allocated %d bytes, Quota "
-        "Exceeded: %s\n",
-        r3.quota_bytes, r3.bytes_allocated, r3.quota_exceeded ? "YES" : "NO");
-    // Run the complex simulation with a 4KB Quota
-    TaskReport r4 = task_spawn(4, 4096, complex_worker);
+//     printf(
+//         "Report Task 1: Quota %d bytes, Peak Allocated %d bytes, Quota "
+//         "Exceeded: %s\n",
+//         r1.quota_bytes, r1.bytes_allocated, r1.quota_exceeded ? "YES" :
+//         "NO");
+//     printf(
+//         "Report Task 2: Quota %d bytes, Peak Allocated %d bytes, Quota "
+//         "Exceeded: %s\n",
+//         r2.quota_bytes, r2.bytes_allocated, r2.quota_exceeded ? "YES" :
+//         "NO");
+//     printf(
+//         "Report Task 3: Quota %d bytes, Peak Allocated %d bytes, Quota "
+//         "Exceeded: %s\n",
+//         r3.quota_bytes, r3.bytes_allocated, r3.quota_exceeded ? "YES" :
+//         "NO");
+//     // Run the complex simulation with a 4KB Quota
+//     TaskReport r4 = task_spawn(4, 4096, complex_worker);
 
-    printf(
-        "Report Task 4: Quota %d bytes, Peak Allocated %d bytes, Quota "
-        "Exceeded: %s\n",
-        r4.quota_bytes, r4.bytes_allocated, r4.quota_exceeded ? "YES" : "NO");
-    return 0;
-}
+//     printf(
+//         "Report Task 4: Quota %d bytes, Peak Allocated %d bytes, Quota "
+//         "Exceeded: %s\n",
+//         r4.quota_bytes, r4.bytes_allocated, r4.quota_exceeded ? "YES" :
+//         "NO");
+//     return 0;
+// }
 
-static int align_bytes(uint32_t n_bytes) {
+static uint32_t align_bytes(uint32_t n_bytes) {
     // align to multiples of 4
     return (n_bytes + 3) & ~3;
 }
@@ -489,10 +597,10 @@ static int find_free_block(uint32_t aligned_n_bytes, int strategy) {
         offset += header.size + HEADER_SIZE;
     }
 
-    // if strategy was 0 and something was found, we would have returned already
-    // else if didn't find anything, we return -1, which is correct for both
-    // strategies the only case left is strategy 1 and we found something, so we
-    // return best_fit
+    // if strategy was 0 and something was found, we would have returned
+    // already else if didn't find anything, we return -1, which is correct
+    // for both strategies the only case left is strategy 1 and we found
+    // something, so we return best_fit
     return best_fit;
 }
 
@@ -507,7 +615,8 @@ static void sweep_and_merge() {
 
         if (header.status == STATUS_FREE) {
             if (prev_free != -1) {
-                // reflect the merge in the header of the previous free block
+                // reflect the merge in the header of the previous free
+                // block
                 prev_free_header.size += header.size + HEADER_SIZE;
                 _write_header(prev_free, prev_free_header.size, STATUS_FREE, 0);
             } else {
@@ -524,4 +633,29 @@ static void sweep_and_merge() {
 
 static bool task_is_active(int task_id) {
     return task_id > 0 && task_id < MAX_TASKS && tasks[task_id].active;
+}
+
+static void free_task_blocks(int task_id) {
+    int offset = 0;
+
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        if (header.status == STATUS_USED && header.task_id == task_id) {
+            _write_header(offset, header.size, STATUS_FREE, 0);
+
+            tasks[task_id].current_alloc -= header.size + HEADER_SIZE;
+
+            for (int i = 0; i < MAX_HANDLES; ++i) {
+                if (handle_table[i] == offset + HEADER_SIZE) {
+                    handle_table[i] = -1;
+                }
+            }
+        }
+
+        offset += header.size + HEADER_SIZE;
+    }
+
+    sweep_and_merge();
 }

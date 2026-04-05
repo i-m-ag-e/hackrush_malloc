@@ -1,7 +1,7 @@
 CFLAGS ?= -Wall -Wextra -std=c11
 
-TARGET = malloc
-OBJS = malloc.o 
+TARGET = test_level_4
+OBJS = malloc.o test_level_4.o
 
 all: $(TARGET)
 
