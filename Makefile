@@ -1,12 +1,21 @@
-CFLAGS ?= -Wall -Wextra -std=c11
+CFLAGS ?= -Wall -Wextra -std=c99 -O2
 
-TARGET = test_level_4
-OBJS = malloc.o test_level_4.o
+# List all the final executables
+TARGETS = test_level_1 test_level_2 test_level_3 test_level_4
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(OBJS)
+test_level_1: malloc.o test_level_1.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+test_level_2: malloc.o test_level_2.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+test_level_3: malloc.o test_level_3.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+test_level_4: malloc.o test_level_4.o
+	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
-	rm -f $(OBJS) $(TARGET)
-
+	rm -f *.o $(TARGETS)
