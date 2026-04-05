@@ -1,13 +1,28 @@
-## Level 1
-
 ### Usage
-`make` and a C compiler supporting C17 is needed (this can be changed in the Makefile) for the following instructions
+
+`make` and a C compiler supporting C99 is needed (this can be changed in the Makefile) for the following instructions
 
 ```shell
 git clone https://github.com/i-m-ag-e/hackrush_malloc.git
-git checkout level_1
-make # creates an executable test_level_1
+make 
+# this creates 4 executables
+# - test_level_1
+# - test_level_2
+# - test_level_3
+# - test_level_4
+
+# specific target can be made by running `make <target_name>`, e.g., `make test_level_1`
 ```
+
+To run the tests
+```
+./test_level_1
+./test_level_2
+./test_level_3
+./test_level_4
+```
+
+## Level 1
 
 `test_level_1.c` is the `level1_stress_test.py` file converted to C (using GenAI). For this, the `main()` function in the initial starter file has been commented out. 
 
