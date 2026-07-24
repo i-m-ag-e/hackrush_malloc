@@ -1,0 +1,517 @@
+/*
+ * MEMSIM — HackRush Starter Harness (C)
+ * ======================================
+ * Fill in every function marked TODO.
+ * Do NOT change any function signatures — the hidden test suite links against
+ * this translation unit.
+ *
+ * Header layout (8 bytes per block, embedded in ram[]):
+ *   Bytes 0-3 : size     (uint32_t) — usable bytes (excluding header)
+ *   Byte  4   : status   (uint8_t)  — FREE=0, USED=1
+ *   Bytes 5-6 : task_id  (uint16_t) — 0 if unowned
+ *   Byte  7   : checksum (uint8_t)  — XOR of bytes 0..6
+ *
+ * Compile:  gcc -std=c99 -Wall -o memsim starter_harness.c
+ */
+
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ── Device constants (do not change) ────────────────────────────────────────
+ */
+#define DEVICE_RAM (64 * 1024)
+#define MIN_ALLOC 4
+#define MAX_ALLOC 8192
+#define ALIGNMENT 4
+#define HEADER_SIZE 8
+
+#define STATUS_FREE 0
+#define STATUS_USED 1
+
+/* ── Global RAM ───────────────────────────────────────────────────────────────
+ */
+uint8_t ram[DEVICE_RAM];
+
+/* ── Header layout (packed, no compiler padding) ──────────────────────────────
+ */
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t size;  /* usable bytes */
+    uint8_t status; /* FREE or USED */
+    uint16_t task_id;
+    uint8_t checksum; /* XOR of bytes 0..6 */
+} BlockHeader;
+#pragma pack(pop)
+
+/* ── Header helpers
+ * ──────────────────────────────────────────────────────────── */
+
+static uint8_t _compute_checksum(uint32_t size, uint8_t status,
+                                 uint16_t task_id) {
+    uint8_t cs = 0;
+    uint8_t buf[7];
+    memcpy(buf, &size, 4);
+    buf[4] = status;
+    memcpy(buf + 5, &task_id, 2);
+    for (int i = 0; i < 7; i++)
+        cs ^= buf[i];
+    return cs;
+}
+
+static void _write_header(int offset, uint32_t size, uint8_t status,
+                          uint16_t task_id) {
+    BlockHeader *h = (BlockHeader *)(ram + offset);
+    h->size = size;
+    h->status = status;
+    h->task_id = task_id;
+    h->checksum = _compute_checksum(size, status, task_id);
+}
+
+static BlockHeader _read_header(int offset, bool *checksum_ok) {
+    BlockHeader h;
+    memcpy(&h, ram + offset, HEADER_SIZE);
+    uint8_t expected = _compute_checksum(h.size, h.status, h.task_id);
+    if (checksum_ok)
+        *checksum_ok = (h.checksum == expected);
+    return h;
+}
+
+#define BLOCK_SIZE 64
+#define N_BLOCKS ((DEVICE_RAM) / (BLOCK_SIZE))
+
+#define MAX_TASKS 256
+
+typedef struct {
+    int task_id;
+    int quota_bytes;
+    int bytes_allocated; /* peak allocated */
+    bool quota_exceeded;
+    /* leaks: scan after fn() returns for blocks still tagged with task_id */
+} TaskReport;
+
+typedef struct {
+    TaskReport report;
+    int current_alloc;
+    bool active;
+} TaskStatus;
+
+static TaskStatus tasks[MAX_TASKS];
+
+static uint32_t align_bytes(uint32_t n_bytes);
+static int find_free_block(uint32_t aligned_n_byte, int strategy);
+static void sweep_and_merge();
+static bool task_is_active(int task_id);
+static void free_task_blocks(int task_id);
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * LEVEL 1 + 2 — Core allocator
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+
+void mem_init(void) {
+    memset(ram, 0, DEVICE_RAM);
+    _write_header(0, DEVICE_RAM - HEADER_SIZE, STATUS_FREE, 0);
+}
+
+/*
+ * Allocate n_bytes of usable memory.
+ * strategy: 0 = first_fit, 1 = best_fit
+ * Returns offset to first usable byte (header_offset + HEADER_SIZE), or -1.
+ */
+int mem_alloc(int n_bytes, int task_id, int strategy) {
+    (void)strategy;
+
+    if (n_bytes < MIN_ALLOC || n_bytes > MAX_ALLOC)
+        return -1;
+
+    uint32_t aligned_n_bytes = align_bytes(n_bytes);
+
+    // check if this allocation would put us over quota before we do any work
+    if (task_is_active(task_id) &&
+        (int)(tasks[task_id].current_alloc + aligned_n_bytes + HEADER_SIZE) >
+            tasks[task_id].report.quota_bytes) {
+        tasks[task_id].report.quota_exceeded = true;
+        return -1;
+    }
+
+    int free_block = find_free_block(aligned_n_bytes, strategy);
+    if (free_block == -1)
+        return -1;
+
+    bool checksum_ok;
+    BlockHeader header = _read_header(free_block, &checksum_ok);
+
+    int remaining_space = header.size - aligned_n_bytes;
+
+    bool will_split = remaining_space >= HEADER_SIZE + MIN_ALLOC;
+    uint32_t given_size = will_split ? aligned_n_bytes : header.size;
+
+    // this time, check against the actual size we would be allocating
+    if (task_is_active(task_id) &&
+        (int)(tasks[task_id].current_alloc + given_size + HEADER_SIZE) >=
+            tasks[task_id].report.quota_bytes) {
+        tasks[task_id].report.quota_exceeded = true;
+        return -1;
+    }
+
+    if (will_split) {
+        _write_header(free_block, aligned_n_bytes, STATUS_USED, task_id);
+        int next_free_location = free_block + HEADER_SIZE + aligned_n_bytes;
+        _write_header(next_free_location, remaining_space - HEADER_SIZE,
+                      STATUS_FREE, 0);
+    } else {
+        _write_header(free_block, header.size, STATUS_USED, task_id);
+    }
+
+    if (task_is_active(task_id)) {
+        tasks[task_id].current_alloc += given_size + HEADER_SIZE;
+        if (tasks[task_id].current_alloc >
+            tasks[task_id].report.bytes_allocated) {
+            tasks[task_id].report.bytes_allocated =
+                tasks[task_id].current_alloc;
+        }
+    }
+
+    return free_block + HEADER_SIZE;
+}
+
+/*
+ * Free the block whose usable area starts at ptr.
+ * Coalesce with the immediately following free block (Level 2).
+ * Returns true on success.
+ */
+bool mem_free(int ptr) {
+    if (ptr < HEADER_SIZE || ptr > DEVICE_RAM - HEADER_SIZE)
+        return false;
+
+    bool checksum_ok;
+    BlockHeader header = _read_header(ptr - HEADER_SIZE, &checksum_ok);
+
+    if (!checksum_ok || header.status == STATUS_FREE)
+        return false;
+
+    _write_header(ptr - HEADER_SIZE, header.size, STATUS_FREE, header.task_id);
+    sweep_and_merge();
+
+    if (header.task_id > 0 && task_is_active(header.task_id)) {
+        tasks[header.task_id].current_alloc -= header.size + HEADER_SIZE;
+    }
+
+    return true;
+}
+
+void mem_dump(void) {
+    int offset = 0;
+    int free_blocks = 0, used_blocks = 0;
+    int free_bytes = 0;
+
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        printf(
+            "[  offset=%04d  size=%-5d  status=%-s  task=%-3d  csum=%-3s  ]\n",
+            offset, header.size, header.status == STATUS_FREE ? "FREE" : "USED",
+            header.task_id, checksum_ok ? "OK" : "BAD");
+        offset += header.size + HEADER_SIZE;
+
+        if (header.status == STATUS_FREE) {
+            free_blocks++;
+            free_bytes += header.size;
+        } else
+            used_blocks++;
+    }
+
+    printf("HEAP SUMMARY: %d blocks | %d used | %d free | %d free bytes\n",
+           used_blocks + free_blocks, used_blocks, free_blocks, free_bytes);
+}
+
+typedef struct {
+    int total_free_bytes;
+    int largest_free_block;
+    int num_free_fragments;
+    float fragmentation_ratio;
+} MemStats;
+
+MemStats mem_stats(void) {
+    MemStats s = {0, 0, 0, 0.0f};
+
+    int offset = 0;
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+        offset += header.size + HEADER_SIZE;
+
+        if (header.status == STATUS_FREE) {
+            s.total_free_bytes += header.size;
+            if (s.largest_free_block < (int)header.size)
+                s.largest_free_block = header.size;
+            s.num_free_fragments++;
+        }
+    }
+
+    s.fragmentation_ratio =
+        s.total_free_bytes == 0
+            ? 0
+            : 1 - s.largest_free_block / (double)s.total_free_bytes;
+    return s;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * LEVEL 3 — Multi-task sandbox
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+
+typedef void (*TaskFn)(void);
+
+TaskReport task_spawn(int task_id, int quota_bytes, TaskFn fn) {
+    tasks[task_id] = (TaskStatus){.report = {.task_id = task_id,
+                                             .bytes_allocated = 0,
+                                             .quota_bytes = quota_bytes,
+                                             .quota_exceeded = false},
+                                  .current_alloc = 0,
+                                  .active = true};
+
+    fn();
+
+    if (tasks[task_id].current_alloc != 0) {
+        printf("Task %d leaked %d bytes\n", task_id,
+               tasks[task_id].current_alloc);
+    }
+
+    tasks[task_id].active = false;
+    return tasks[task_id].report;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * LEVEL 4 — Heap compaction + OOM recovery
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+
+#define MAX_HANDLES 4096
+
+static int handle_table[MAX_HANDLES]; /* handle -> offset; -1 = invalid */
+static int next_handle = 0;
+
+void handles_init(void) {
+    for (int i = 0; i < MAX_HANDLES; i++)
+        handle_table[i] = -1;
+    next_handle = 0;
+}
+
+/* Returns handle (>= 0) or -1 on failure. */
+int mem_alloc_handle(int n_bytes, int task_id) {
+    int handle = -1;
+    for (int i = 0; i < MAX_HANDLES; ++i) {
+        if (handle_table[i] == -1) {
+            handle = i;
+            break;
+        }
+    }
+
+    if (handle == -1)
+        return -1;
+
+    int ptr = mem_alloc(n_bytes, task_id, 1);
+    if (ptr == -1)
+        return -1;
+
+    handle_table[handle] = ptr;
+    return handle;
+}
+
+int deref_handle(int handle);
+
+bool mem_free_handle(int handle) {
+    int ptr = deref_handle(handle);
+    if (ptr == -1)
+        return false;
+
+    if (mem_free(ptr)) {
+        handle_table[handle] = -1;
+        return true;
+    }
+    return false;
+}
+
+/* Returns current raw offset for handle, or -1. */
+int deref_handle(int handle) {
+    if (handle < 0 || handle >= MAX_HANDLES)
+        return -1;
+    return handle_table[handle];
+}
+
+/* Compact heap, patch handle_table. Returns bytes recovered. */
+int mem_compact(void) {
+    int read_head = 0, write_head = 0;
+
+    while (read_head < DEVICE_RAM) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(read_head, &checksum_ok);
+
+        if (header.status == STATUS_USED) {
+            int block_size = header.size + HEADER_SIZE;
+
+            if (write_head != read_head) {
+                memmove(&ram[write_head], &ram[read_head], block_size);
+
+                int old_ptr = read_head + HEADER_SIZE;
+                int new_ptr = write_head + HEADER_SIZE;
+
+                for (int i = 0; i < MAX_HANDLES; ++i) {
+                    if (handle_table[i] == old_ptr) {
+                        handle_table[i] = new_ptr;
+                        break;
+                    }
+                }
+            }
+
+            write_head += block_size;
+        }
+
+        read_head += header.size + HEADER_SIZE;
+    }
+
+    int free_bytes = 0;
+    if (write_head < DEVICE_RAM) {
+        int remaining_bytes = DEVICE_RAM - write_head;
+        if (remaining_bytes >= HEADER_SIZE + MIN_ALLOC) {
+            _write_header(write_head, remaining_bytes - HEADER_SIZE,
+                          STATUS_FREE, 0);
+            free_bytes = remaining_bytes;
+        }
+    }
+
+    sweep_and_merge();
+    return free_bytes;
+}
+
+/* Alloc with compaction + OOM eviction fallback. Returns handle or -1. */
+int mem_alloc_or_compact(int n_bytes, int task_id) {
+    int handle = mem_alloc_handle(n_bytes, task_id);
+    if (handle != -1)
+        return handle;
+
+    printf(
+        "mem_alloc_or_compact: request of %d bytes from task %d failed, "
+        "attempting compaction...\n",
+        n_bytes, task_id);
+
+    mem_compact();
+    handle = mem_alloc_handle(n_bytes, task_id);
+
+    if (handle != -1)
+        return handle;
+
+    printf(
+        "mem_alloc_or_compact: compaction failed; searching for task to "
+        "evict\n");
+
+    int largest_idle_task = -1;
+    int largest_idle_alloc = 0;
+    for (int i = 1; i < MAX_TASKS; ++i) {
+        if (!task_is_active(i) && tasks[i].current_alloc > largest_idle_alloc) {
+            largest_idle_task = i;
+            largest_idle_alloc = tasks[i].current_alloc;
+        }
+    }
+
+    if (largest_idle_task != -1) {
+        printf("mem_alloc_or_compact: evicting task %d, reclaiming %d bytes\n",
+               largest_idle_task, largest_idle_alloc);
+
+        free_task_blocks(largest_idle_task);
+        tasks[largest_idle_task].active = false;
+
+        handle = mem_alloc_handle(n_bytes, task_id);
+        if (handle != -1)
+            return handle;
+    }
+
+    printf(
+        "mem_alloc_or_compact: Fatal error: both compaction and eviction "
+        "failed\n");
+    return -1;
+}
+
+static uint32_t align_bytes(uint32_t n_bytes) {
+    return (n_bytes + 3) & ~3;
+}
+
+static int find_free_block(uint32_t aligned_n_bytes, int strategy) {
+    assert(aligned_n_bytes % 4 == 0);
+
+    int offset = 0;
+    int best_fit = -1, best_fit_diff = 0;
+    while (offset < DEVICE_RAM) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        if (header.status == STATUS_FREE && header.size >= aligned_n_bytes) {
+            if (strategy == 0 || header.size == aligned_n_bytes)
+                return offset;
+            else if (strategy == 1 &&
+                     (best_fit == -1 || header.size - aligned_n_bytes <
+                                            (uint32_t)best_fit_diff)) {
+                best_fit_diff = header.size - aligned_n_bytes;
+                best_fit = offset;
+            }
+        }
+        offset += header.size + HEADER_SIZE;
+    }
+    return best_fit;
+}
+
+static void sweep_and_merge() {
+    int offset = 0;
+    int prev_free = -1;
+    BlockHeader prev_free_header;
+
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        if (header.status == STATUS_FREE) {
+            if (prev_free != -1) {
+                prev_free_header.size += header.size + HEADER_SIZE;
+                _write_header(prev_free, prev_free_header.size, STATUS_FREE, 0);
+            } else {
+                prev_free = offset;
+                prev_free_header = header;
+            }
+        } else {
+            prev_free = -1;
+        }
+        offset += header.size + HEADER_SIZE;
+    }
+}
+
+static bool task_is_active(int task_id) {
+    return task_id > 0 && task_id < MAX_TASKS && tasks[task_id].active;
+}
+
+static void free_task_blocks(int task_id) {
+    int offset = 0;
+
+    while (DEVICE_RAM - HEADER_SIZE > offset) {
+        bool checksum_ok;
+        BlockHeader header = _read_header(offset, &checksum_ok);
+
+        if (header.status == STATUS_USED && header.task_id == task_id) {
+            _write_header(offset, header.size, STATUS_FREE, 0);
+
+            tasks[task_id].current_alloc -= header.size + HEADER_SIZE;
+
+            for (int i = 0; i < MAX_HANDLES; ++i) {
+                if (handle_table[i] == offset + HEADER_SIZE) {
+                    handle_table[i] = -1;
+                }
+            }
+        }
+        offset += header.size + HEADER_SIZE;
+    }
+    sweep_and_merge();
+}
